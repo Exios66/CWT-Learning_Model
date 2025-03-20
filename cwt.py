@@ -101,6 +101,14 @@ REQUIRED_FEATURES = [
     "alpha_power", "theta_power"
 ]
 
+# Define common features for prediction
+COMMON_FEATURES = [
+    "pulse_rate", "blood_pressure_sys", "resp_rate", 
+    "pupil_diameter_left", "pupil_diameter_right", 
+    "fixation_duration", "blink_rate", "gaze_x", "gaze_y", 
+    "alpha_power", "theta_power"
+]
+
 # Set up logging
 logger = None
 
@@ -657,8 +665,8 @@ def predict(data, model_type=None, threshold=None, infer_missing=False):
     elif hasattr(model, 'feature_names_in_'):
         features = model.feature_names_in_
     else:
-        # Use common features
-        features = COMMON_FEATURES
+        # Use required features as fallback
+        features = REQUIRED_FEATURES
     
     # Check for missing features
     missing_features = [feature for feature in features if feature not in df.columns]
