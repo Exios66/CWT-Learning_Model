@@ -88,7 +88,8 @@ DATA_FILES = {
 WORKLOAD_CLASSES = {
     0: "Low",
     1: "Medium",
-    2: "High"
+    2: "High",
+    None: "Unknown"
 }
 
 # Define required features for interactive input
@@ -1233,7 +1234,15 @@ def find_latest_model(input_data=None):
         return str(latest_model), None
 
 def find_model_by_type(model_type):
-    """Find the most recent model of a specific type."""
+    """
+    Find the most recent model of a specific type.
+    
+    Args:
+        model_type (str): Type of model to find (rf, svm, mlp, etc.)
+        
+    Returns:
+        tuple: (model_path, metadata) where metadata is a dict containing model info
+    """
     search_dirs = [
         Path(f'models/sample/{model_type}'),
         Path(f'models/advanced/{model_type}')
@@ -1257,10 +1266,29 @@ def find_model_by_type(model_type):
     # Find corresponding scaler
     scaler_path = find_scaler_for_model(latest_model)
     
+    # Create metadata dictionary
+    metadata = {
+        'model_type': model_type,
+        'model_path': str(latest_model),
+        'scaler_path': str(scaler_path) if scaler_path else None,
+        'created_at': datetime.fromtimestamp(latest_model.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+    }
+    
+    # Check for metadata file
+    metadata_path = latest_model.parent / "metadata.json"
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, 'r') as f:
+                file_metadata = json.load(f)
+                # Merge file metadata with our metadata
+                metadata.update(file_metadata)
+        except Exception as e:
+            logger.warning(f"Error reading metadata file: {e}")
+    
     if scaler_path:
         logger.info(f"Selected {model_type} model: {latest_model}")
         logger.info(f"Found corresponding scaler: {scaler_path}")
-        return str(latest_model), str(scaler_path)
+        return str(latest_model), metadata
     else:
         logger.error(f"No scaler found for {model_type} model: {latest_model}")
         return None, None

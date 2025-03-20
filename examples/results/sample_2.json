@@ -1,0 +1,17 @@
+{
+  "sample_id": "S002",
+  "pulse_rate": 76.2,
+  "blood_pressure_sys": 125.6,
+  "resp_rate": 17.3,
+  "pupil_diameter_left": 4.6,
+  "pupil_diameter_right": 4.5,
+  "fixation_duration": 230.5,
+  "blink_rate": 13.8,
+  "workload_intensity": 53.7,
+  "gaze_x": 520.1,
+  "gaze_y": 390.5,
+  "alpha_power": 17.5,
+  "theta_power": 20.2,
+  "alpha_theta_ratio": 0.87,
+  "skin_conductance": 8.9
+}

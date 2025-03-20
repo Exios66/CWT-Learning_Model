@@ -53,6 +53,7 @@ To get up and running quickly with the CWT Tool, simply run:
 ```
 
 This will:
+
 1. Set up the CWT environment
 2. Train all available model types (with parallel processing)
 3. Prepare sample predictions and analyses

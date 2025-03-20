@@ -34,10 +34,10 @@ if not CWT_SCRIPT.exists():
 
 def run_prediction(input_file, output_file=None):
     """Run the CWT prediction on an input file"""
-    cmd = [sys.executable, str(CWT_SCRIPT), "predict", "--input", str(input_file)]
+    cmd = [sys.executable, str(CWT_SCRIPT), "predict", "--input-json", str(input_file)]
     
     if output_file:
-        cmd.extend(["--output", str(output_file)])
+        cmd.extend(["--output-json", str(output_file)])
     
     print(f"\nRunning: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -97,10 +97,10 @@ def process_all_examples():
 
 def main():
     """Main entry point"""
-    # Make sure the models are installed
-    if not Path("models").exists() or not list(Path("models").glob("*.joblib")):
-        print("No models found. Installing sample models first...")
-        subprocess.run([sys.executable, str(CWT_SCRIPT), "install-models"])
+    # Make sure the environment is set up
+    if not Path("../models").exists() or not list(Path("../models").glob("**/*.joblib")):
+        print("Models directory not found or empty. Setting up CWT environment first...")
+        subprocess.run([sys.executable, str(CWT_SCRIPT), "setup"])
     
     process_all_examples()
     
