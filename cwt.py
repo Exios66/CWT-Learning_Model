@@ -73,6 +73,7 @@ import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 
 import tqdm
+import glob
 
 from predictor.predictor import predict_new_data
 
@@ -592,25 +593,72 @@ def predict(data, model_type=None, threshold=None, infer_missing=False):
             logger.error(f"No model found for type: {model_type}")
             raise ValueError(f"No model found for type: {model_type}")
     
-    # Load the model and scaler
-    with open(model_path, 'rb') as f:
-        model = pickle.load(f)
+    # Load the model
+    try:
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+    except Exception as e:
+        logger.error(f"Error loading model {model_path}: {str(e)}")
+        raise ValueError(f"Could not load model: {str(e)}")
     
-    scaler_path = os.path.dirname(model_path) + "/scaler.pkl"
-    if not os.path.exists(scaler_path):
-        # Try to find a shared scaler
-        shared_scaler_path = os.path.join(os.path.dirname(os.path.dirname(model_path)), "shared_scaler.pkl")
-        if os.path.exists(shared_scaler_path):
-            scaler_path = shared_scaler_path
-        else:
-            logger.error(f"No scaler found for model: {model_path}")
-            raise FileNotFoundError(f"No scaler found for model: {model_path}")
+    # Load the scaler
+    scaler_path = None
+    if metadata and 'scaler_path' in metadata:
+        scaler_path = metadata['scaler_path']
     
-    with open(scaler_path, 'rb') as f:
-        scaler = pickle.load(f)
+    if not scaler_path or not os.path.exists(scaler_path):
+        # Try to find a scaler
+        model_dir = os.path.dirname(model_path)
+        potential_scalers = [
+            os.path.join(model_dir, "scaler.pkl"),
+            os.path.join(model_dir, "scaler.joblib")
+        ]
+        
+        # Try to find a scaler with a similar name pattern
+        model_name = os.path.basename(model_path)
+        if "predictor" in model_name:
+            scaler_name = model_name.replace("predictor", "scaler")
+            potential_scalers.append(os.path.join(model_dir, scaler_name))
+        
+        # Check for shared scaler
+        potential_scalers.append(os.path.join(os.path.dirname(model_dir), "shared_scaler.pkl"))
+        potential_scalers.append(os.path.join(os.path.dirname(model_dir), "shared_scaler.joblib"))
+        
+        # Try each potential scaler path
+        for potential_path in potential_scalers:
+            if os.path.exists(potential_path):
+                scaler_path = potential_path
+                logger.info(f"Found scaler at: {scaler_path}")
+                break
+        
+        # If still no scaler, try glob pattern
+        if not scaler_path:
+            scaler_glob = glob.glob(os.path.join(model_dir, "*scaler*.joblib"))
+            if scaler_glob:
+                scaler_path = scaler_glob[0]
+                logger.info(f"Found scaler using glob pattern: {scaler_path}")
     
-    # Extract features from metadata
-    features = metadata.get('features', [])
+    if not scaler_path or not os.path.exists(scaler_path):
+        logger.error(f"No scaler found for model: {model_path}")
+        raise FileNotFoundError(f"No scaler found for model: {model_path}")
+    
+    # Load the scaler
+    try:
+        with open(scaler_path, 'rb') as f:
+            scaler = pickle.load(f)
+    except Exception as e:
+        logger.error(f"Error loading scaler {scaler_path}: {str(e)}")
+        raise ValueError(f"Could not load scaler: {str(e)}")
+    
+    # Extract features from metadata or model
+    features = None
+    if metadata and 'features' in metadata:
+        features = metadata['features']
+    elif hasattr(model, 'feature_names_in_'):
+        features = model.feature_names_in_
+    else:
+        # Use common features
+        features = COMMON_FEATURES
     
     # Check for missing features
     missing_features = [feature for feature in features if feature not in df.columns]
@@ -625,22 +673,35 @@ def predict(data, model_type=None, threshold=None, infer_missing=False):
                 df[feature] = 0.0
     
     # Prepare data for prediction
-    X = df[features].values
-    X_scaled = scaler.transform(X)
+    try:
+        # Get available features that match with what the model was trained on
+        available_features = [f for f in features if f in df.columns]
+        if not available_features:
+            raise ValueError("No matching features found between model and input data")
+        
+        X = df[available_features].values
+        X_scaled = scaler.transform(X)
+    except Exception as e:
+        logger.error(f"Error preparing data for prediction: {str(e)}")
+        raise ValueError(f"Error preparing data: {str(e)}")
     
     # Make prediction
-    if hasattr(model, 'predict_proba'):
-        # Get class probabilities
-        y_proba = model.predict_proba(X_scaled)
-        # Get class predictions
-        y_pred = model.predict(X_scaled)
-        
-        # Get confidences for the predicted classes
-        confidences = [y_proba[i][pred] for i, pred in enumerate(y_pred)]
-    else:
-        # For models without predict_proba, use a placeholder confidence
-        y_pred = model.predict(X_scaled)
-        confidences = [0.99] * len(y_pred)
+    try:
+        if hasattr(model, 'predict_proba'):
+            # Get class probabilities
+            y_proba = model.predict_proba(X_scaled)
+            # Get class predictions
+            y_pred = model.predict(X_scaled)
+            
+            # Get confidences for the predicted classes
+            confidences = [y_proba[i][pred] for i, pred in enumerate(y_pred)]
+        else:
+            # For models without predict_proba, use a placeholder confidence
+            y_pred = model.predict(X_scaled)
+            confidences = [0.99] * len(y_pred)
+    except Exception as e:
+        logger.error(f"Error making prediction: {str(e)}")
+        raise ValueError(f"Error making prediction: {str(e)}")
     
     # Apply threshold if specified
     if threshold is not None:
@@ -1135,6 +1196,9 @@ def find_latest_model(input_data=None):
     Args:
         input_data: Optional input data for prediction. If provided, this will be used to determine
                     the best model to use based on the input characteristics.
+                    
+    Returns:
+        tuple: (model_path, metadata) for the best model
     """
     
     # If input data is provided, try to select the most appropriate model based on characteristics
@@ -1144,41 +1208,41 @@ def find_latest_model(input_data=None):
             if 'workload_intensity' in input_data and float(input_data['workload_intensity']) > 60:
                 model_type = 'rf'
                 logger.info(f"Detected high workload intensity ({input_data['workload_intensity']}), using Random Forest model")
-                model_paths = find_model_by_type('rf')
-                if model_paths[0] is not None:
-                    return model_paths
+                model_path, metadata = find_model_by_type('rf')
+                if model_path is not None:
+                    return model_path, metadata
                 logger.warning("No RF model found for high workload. Falling back to other models.")
             
             # For medium workload, use MLP model
             elif 'workload_intensity' in input_data and 40 <= float(input_data['workload_intensity']) <= 60:
                 model_type = 'mlp'
                 logger.info(f"Detected medium workload intensity ({input_data['workload_intensity']}), using MLP model")
-                model_paths = find_model_by_type('mlp')
-                if model_paths[0] is not None:
-                    return model_paths
+                model_path, metadata = find_model_by_type('mlp')
+                if model_path is not None:
+                    return model_path, metadata
                 logger.warning("No MLP model found for medium workload. Falling back to other models.")
             
             # For low workload, use LR model
             elif 'workload_intensity' in input_data and float(input_data['workload_intensity']) < 40:
                 model_type = 'lr'
                 logger.info(f"Detected low workload intensity ({input_data['workload_intensity']}), using Logistic Regression model")
-                model_paths = find_model_by_type('lr')
-                if model_paths[0] is not None:
-                    return model_paths
+                model_path, metadata = find_model_by_type('lr')
+                if model_path is not None:
+                    return model_path, metadata
                 logger.warning("No LR model found for low workload. Falling back to other models.")
 
             # If we could not find a specific model for the workload intensity, try general fallbacks
             # Try falling back to any RF model since they tend to generalize better
-            model_paths = find_model_by_type('rf')
-            if model_paths[0] is not None:
+            model_path, metadata = find_model_by_type('rf')
+            if model_path is not None:
                 logger.info("Using Random Forest model as fallback")
-                return model_paths
+                return model_path, metadata
                 
             # Try LR as another fallback
-            model_paths = find_model_by_type('lr')
-            if model_paths[0] is not None:
+            model_path, metadata = find_model_by_type('lr')
+            if model_path is not None:
                 logger.info("Using Logistic Regression model as fallback")
-                return model_paths
+                return model_path, metadata
                 
         except (ValueError, KeyError) as e:
             logger.warning(f"Could not determine best model based on input data: {e}")
@@ -1198,40 +1262,71 @@ def find_latest_model(input_data=None):
         Path('models/sample/gb'),
         Path('models/advanced/svm'),
         Path('models/advanced/gb'),
-        Path('models/sample/default'),
     ]
     
-    # Create base directories if they don't exist
-    os.makedirs('models/sample/default', exist_ok=True)
-    
-    # Look for model files in all search directories
-    all_model_files = []
+    all_models = []
     for directory in search_dirs:
         if directory.exists():
-            model_files = list(directory.glob(f"*.joblib"))
-            # Exclude scaler files
-            model_files = [f for f in model_files if "scaler" not in f.name.lower()]
-            if model_files:
-                # Find the newest model in this directory
-                newest_model = max(model_files, key=lambda x: x.stat().st_mtime)
-                all_model_files.append(newest_model)
+            # Search for model files, filter out scaler files
+            model_files = []
+            for ext in ['*.joblib', '*.pkl']:
+                files = list(directory.glob(ext))
+                # Filter out scaler files
+                files = [f for f in files if "scaler" not in f.name.lower()]
+                model_files.extend(files)
+            
+            all_models.extend(model_files)
     
-    if not all_model_files:
-        logger.error("No trained models found")
+    if not all_models:
+        logger.error("No model files found in any of the search directories")
         return None, None
     
-    # Sort by creation time (newest first)
-    latest_model = max(all_model_files, key=lambda x: x.stat().st_mtime)
+    # Find the most recent model file
+    latest_model = max(all_models, key=lambda x: x.stat().st_mtime)
     logger.info(f"Found latest model: {latest_model}")
     
-    # Find corresponding scaler
+    # Try to find corresponding scaler
     scaler_path = find_scaler_for_model(latest_model)
     if scaler_path:
         logger.info(f"Found corresponding scaler: {scaler_path}")
-        return str(latest_model), str(scaler_path)
     else:
-        logger.error(f"Scaler file not found for model {latest_model}")
-        return str(latest_model), None
+        logger.warning(f"No scaler found for model: {latest_model}")
+        # Try to look for any scaler in the same directory
+        scaler_files = list(latest_model.parent.glob("*scaler*.joblib"))
+        if not scaler_files:
+            scaler_files = list(latest_model.parent.glob("*scaler*.pkl"))
+        
+        if scaler_files:
+            scaler_path = scaler_files[0]
+            logger.info(f"Found alternative scaler: {scaler_path}")
+    
+    # Determine model type from path
+    model_type = None
+    for mtype in ['rf', 'mlp', 'lr', 'knn', 'svm', 'gb']:
+        if mtype in str(latest_model).lower():
+            model_type = mtype
+            break
+    
+    # Create metadata dictionary
+    metadata = {
+        'model_type': model_type,
+        'model_path': str(latest_model),
+        'scaler_path': str(scaler_path) if scaler_path else None,
+        'created_at': datetime.fromtimestamp(latest_model.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+    }
+    
+    # Check for metadata file
+    metadata_path = latest_model.parent / "metadata.json"
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, 'r') as f:
+                file_metadata = json.load(f)
+                # Merge file metadata with our metadata
+                metadata.update(file_metadata)
+        except Exception as e:
+            logger.warning(f"Error reading metadata file: {e}")
+    
+    return str(latest_model), metadata
 
 def find_model_by_type(model_type):
     """
@@ -2882,7 +2977,7 @@ def find_best_model():
             
         # Check for model file
         model_files = [f for f in os.listdir(model_type_dir) 
-                      if f.endswith('.pkl') and not f.startswith('scaler')]
+                      if (f.endswith('.pkl') or f.endswith('.joblib')) and not f.startswith('scaler')]
         
         for model_file in model_files:
             model_path = os.path.join(model_type_dir, model_file)
@@ -2896,11 +2991,22 @@ def find_best_model():
                     
                     # Check if it has accuracy information
                     if 'accuracy' in metadata:
-                        accuracy = float(metadata['accuracy'])
-                        if accuracy > best_accuracy:
-                            best_accuracy = accuracy
-                            best_model_path = model_path
-                            best_metadata = metadata
+                        try:
+                            # Handle accuracy as either string or float
+                            accuracy_value = metadata['accuracy']
+                            if isinstance(accuracy_value, str):
+                                # Remove any non-numeric characters
+                                accuracy_value = ''.join(c for c in accuracy_value if c.isdigit() or c == '.')
+                                accuracy = float(accuracy_value)
+                            else:
+                                accuracy = float(accuracy_value)
+                                
+                            if accuracy > best_accuracy:
+                                best_accuracy = accuracy
+                                best_model_path = model_path
+                                best_metadata = metadata
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Error parsing accuracy value '{metadata['accuracy']}': {e}")
                 except Exception as e:
                     logger.warning(f"Error reading metadata for {model_path}: {e}")
     
