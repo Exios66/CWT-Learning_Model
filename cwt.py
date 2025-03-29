@@ -109,6 +109,22 @@ COMMON_FEATURES = [
     "alpha_power", "theta_power"
 ]
 
+# Group features by modality for better handling of missing data types
+FEATURE_MODALITIES = {
+    "physiological": ["pulse_rate", "blood_pressure_sys", "resp_rate"],
+    "pupil": ["pupil_diameter_left", "pupil_diameter_right"],
+    "gaze": ["fixation_duration", "blink_rate", "gaze_x", "gaze_y"],
+    "eeg": ["alpha_power", "theta_power"]
+}
+
+# Define modality importance for confidence scoring (higher = more important)
+MODALITY_IMPORTANCE = {
+    "physiological": 0.3,  # Basic physiological signals (moderate importance)
+    "pupil": 0.3,          # Pupil metrics (high correlation with workload)
+    "gaze": 0.2,           # Gaze metrics (moderate correlation)
+    "eeg": 0.2             # EEG signals (important for cognitive state)
+}
+
 # Set up logging
 logger = None
 
@@ -564,6 +580,39 @@ def train_model(df, features, model_type='rf', scaler=None):
         raise
 
 # ---------------------- PREDICTION FUNCTIONS ---------------------- #
+def calculate_modality_confidence(available_features):
+    """
+    Calculate a confidence score based on which feature modalities are available.
+    
+    Args:
+        available_features (list): List of feature names that are available
+        
+    Returns:
+        tuple: (confidence_score, missing_modalities, available_modalities)
+            - confidence_score: float between 0-1 indicating prediction confidence
+            - missing_modalities: list of missing modality names
+            - available_modalities: list of available modality names
+    """
+    available_modalities = []
+    missing_modalities = []
+    confidence_score = 0.0
+    
+    # Check each modality
+    for modality, features in FEATURE_MODALITIES.items():
+        # Check if at least half of the features in this modality are available
+        available_count = sum(1 for feature in features if feature in available_features)
+        if available_count >= len(features) / 2:
+            available_modalities.append(modality)
+            confidence_score += MODALITY_IMPORTANCE[modality]
+        else:
+            missing_modalities.append(modality)
+    
+    # Normalize confidence to account for case when not all modalities are defined
+    if confidence_score > 0 and sum(MODALITY_IMPORTANCE.values()) > 0:
+        confidence_score = min(1.0, confidence_score / sum(MODALITY_IMPORTANCE.values()))
+    
+    return confidence_score, missing_modalities, available_modalities
+
 def predict(data, model_type=None, threshold=None, infer_missing=False):
     """
     Predict cognitive workload from input data.
@@ -575,11 +624,27 @@ def predict(data, model_type=None, threshold=None, infer_missing=False):
         infer_missing (bool, optional): Whether to infer missing features. Defaults to False.
         
     Returns:
-        dict: Prediction results with workload class and confidence
+        dict: Prediction results with workload class, confidence, and data quality metrics
     """
+    # Check what features are available initially
+    if isinstance(data, dict):
+        initial_features = list(data.keys())
+    else:
+        initial_features = list(data.columns)
+    
+    # Calculate initial confidence based on available modalities
+    initial_confidence, missing_modalities, available_modalities = calculate_modality_confidence(initial_features)
+    
     # Handle missing features if requested
+    missing_features_before = []
     if infer_missing:
+        if isinstance(data, dict):
+            missing_features_before = [f for f in COMMON_FEATURES if f not in data]
+        else:
+            missing_features_before = [f for f in COMMON_FEATURES if f not in data.columns]
+        
         data = infer_missing_features(data)
+        logger.info(f"Inferred {len(missing_features_before)} missing features")
     
     # Convert input to DataFrame if it's a dictionary
     is_dict_input = isinstance(data, dict)
@@ -594,12 +659,13 @@ def predict(data, model_type=None, threshold=None, infer_missing=False):
         if not model_path:
             logger.error("No suitable model found for prediction")
             raise ValueError("No suitable model found for prediction")
-        model_type = metadata.get('model_type', 'unknown')
+        model_type = metadata.get('model_type', 'unknown') if isinstance(metadata, dict) else 'unknown'
     else:
         model_path, metadata = find_model_by_type(model_type)
         if not model_path:
             logger.error(f"No model found for type: {model_type}")
             raise ValueError(f"No model found for type: {model_type}")
+        metadata = {"model_type": model_type}  # Create basic metadata
     
     # Load the model
     try:
@@ -665,8 +731,8 @@ def predict(data, model_type=None, threshold=None, infer_missing=False):
     elif hasattr(model, 'feature_names_in_'):
         features = model.feature_names_in_
     else:
-        # Use required features as fallback
-        features = REQUIRED_FEATURES
+        # Use common features as fallback
+        features = COMMON_FEATURES
     
     # Check for missing features
     missing_features = [feature for feature in features if feature not in df.columns]
@@ -679,6 +745,10 @@ def predict(data, model_type=None, threshold=None, infer_missing=False):
             # Fill missing features with zeros for now
             for feature in missing_features:
                 df[feature] = 0.0
+    
+    # Get final confidence based on what features are actually available after inferences
+    final_features = list(df.columns)
+    final_confidence, final_missing_modalities, final_available_modalities = calculate_modality_confidence(final_features)
     
     # Prepare data for prediction
     try:
@@ -717,21 +787,69 @@ def predict(data, model_type=None, threshold=None, infer_missing=False):
             if conf < threshold:
                 y_pred[i] = -1  # Use -1 to indicate low confidence
     
+    # Adjust model confidence based on available features
+    adjusted_confidences = [conf * final_confidence for conf in confidences]
+    
     # Create result dictionary
     results = []
     for i in range(len(df)):
         workload_class = int(y_pred[i]) if y_pred[i] != -1 else None
-        workload_label = WORKLOAD_CLASSES.get(workload_class, "Unknown")
         
+        # Map class to label
+        if workload_class in WORKLOAD_CLASSES:
+            workload_label = WORKLOAD_CLASSES[workload_class]
+        else:
+            # Manual mapping fallback
+            if workload_class == 0:
+                workload_label = "Low"
+            elif workload_class == 1:
+                workload_label = "Medium"
+            elif workload_class == 2:
+                workload_label = "High"
+            else:
+                workload_label = "Unknown"
+        
+        # Create base result
         result = {
-            "workload_class": workload_class,
-            "workload_label": workload_label,
-            "confidence": confidences[i],
-            "model_type": model_type
+            'workload_class': workload_class,
+            'workload_label': workload_label,
+            'model_confidence': float(confidences[i]) if confidences[i] is not None else None,
+            'adjusted_confidence': float(adjusted_confidences[i]) if adjusted_confidences[i] is not None else None,
+            'data_quality': {
+                'initial_confidence': float(initial_confidence),
+                'final_confidence': float(final_confidence),
+                'missing_modalities': final_missing_modalities,
+                'available_modalities': final_available_modalities,
+                'inferred_features': missing_features_before if infer_missing else [],
+                'missing_features': missing_features,
+                'used_features': available_features
+            }
         }
+        
+        # Generate quality warning message
+        quality_message = ""
+        if final_missing_modalities:
+            quality_message += f"Missing data modalities: {', '.join(final_missing_modalities)}. "
+        
+        if missing_features_before and infer_missing:
+            quality_message += f"Inferred {len(missing_features_before)} features. "
+        
+        if final_confidence < 0.6:
+            quality_message += "Low prediction confidence due to limited data. "
+        elif final_confidence < 0.8:
+            quality_message += "Moderate prediction confidence. "
+        
+        if quality_message:
+            result['quality_warning'] = quality_message.strip()
+        
+        # Add additional info
+        result['model_type'] = model_type
+        result['model_path'] = model_path
+        result['prediction_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
         results.append(result)
     
-    # Return in the same format as input
+    # If input was a dictionary, return a single result
     if is_dict_input:
         return results[0]
     else:
@@ -2226,18 +2344,19 @@ def predict_automatic(input_data, output_path=None, model_path=None, scaler_path
 # ---------------------- FEATURE INFERENCE ---------------------- #
 def infer_missing_features(data, reference_data=None):
     """
-    Infer missing features based on available data and correlation patterns.
-    Uses a combination of methods:
-    1. Standard imputation for simple missing values
-    2. Regression models for related features (e.g., pupil metrics from other physiological data)
-    3. Empirical distributions when no correlation data is available
+    Infer missing features in the data based on available features.
+    
+    This function intelligently infers missing features by leveraging correlations
+    between different physiological, EEG, and gaze metrics. It can handle any
+    combination of available metrics to make reasonable predictions for missing values.
     
     Args:
         data (dict or DataFrame): Input data with potentially missing features
-        reference_data (DataFrame, optional): External reference data to use for inference
-        
+        reference_data (DataFrame, optional): Reference data to use for inference.
+                                           If None, loads default reference data.
+    
     Returns:
-        dict or DataFrame: Data with inferred values for missing features
+        DataFrame or dict: Input data with inferred values for missing features
     """
     # Convert input to DataFrame if it's a dictionary
     is_dict_input = isinstance(data, dict)
@@ -2248,52 +2367,262 @@ def infer_missing_features(data, reference_data=None):
     
     logger.info(f"Inferring missing features for dataset with {len(df)} rows")
     
-    # Core features that we expect to have
-    core_features = [
-        "pulse_rate", "blood_pressure_sys", "resp_rate", "workload_intensity",
-        "pupil_diameter_left", "pupil_diameter_right", "fixation_duration", 
-        "blink_rate", "gaze_x", "gaze_y", "alpha_power", "theta_power"
-    ]
+    # Identify missing features by modality
+    missing_features = {}
+    available_features = {}
     
-    # Check which features are missing
-    missing_features = [f for f in core_features if f not in df.columns or df[f].isnull().all()]
+    for modality, features in FEATURE_MODALITIES.items():
+        missing = [feature for feature in features if feature not in df.columns]
+        available = [feature for feature in features if feature in df.columns]
+        
+        if missing:
+            missing_features[modality] = missing
+            logger.info(f"Detected missing {modality} features: {missing}")
+        
+        if available:
+            available_features[modality] = available
     
-    if not missing_features:
-        logger.info("No missing core features detected")
-        return data  # Return original data if nothing is missing
+    # If no features are missing, return the original data
+    if not any(missing_features.values()):
+        logger.info("No features to infer")
+        return data
     
-    logger.info(f"Detected missing features: {missing_features}")
-    
-    # Load reference data if none provided
+    # Load reference data if not provided
     if reference_data is None:
-        try:
-            reference_data = load_reference_data()
-        except Exception as e:
-            logger.warning(f"Could not load reference data: {e}. Using empirical distributions.")
-            reference_data = None
+        logger.info("Loading reference data for feature inference")
+        reference_data = load_reference_data()
     
-    # Apply different inference methods based on available data
-    for feature in missing_features:
-        # Check if we have a specific imputation function for this feature
-        if feature in ["pupil_diameter_left", "pupil_diameter_right"]:
-            df = infer_pupil_metrics(df, reference_data)
+    # Check if we have enough reference data
+    if reference_data is None or len(reference_data) < 10:
+        logger.warning("Insufficient reference data for inference, generating synthetic data")
+        reference_data = generate_synthetic_reference_data(n_samples=1000)
+    
+    # Track which modalities were successfully inferred
+    inferred_modalities = set()
+    
+    # Use different strategies based on what's available
+    
+    # 1. Infer workload intensity if missing (needed for other inferences)
+    if 'workload_intensity' not in df.columns:
+        logger.info("Inferring workload intensity from other metrics")
+        df = infer_workload_intensity(df, reference_data)
+        inferred_modalities.add('workload')
+    
+    # 2. Infer pupil metrics if missing
+    if 'pupil' in missing_features:
+        pupil_metrics = missing_features['pupil']
         
-        elif feature in ["alpha_power", "theta_power"]:
+        if len(pupil_metrics) == 2:  # Both pupil metrics are missing
+            logger.info("Inferring both pupil diameters from other physiological metrics")
+            
+            # Check if we can use workload intensity
+            if 'workload_intensity' in df.columns:
+                logger.info("Using workload intensity to infer pupil diameters")
+                df = infer_pupil_metrics(df, reference_data)
+                inferred_modalities.add('pupil')
+            
+            # Alternatively, use physiological data if available
+            elif 'physiological' in available_features and len(available_features['physiological']) >= 2:
+                logger.info("Using physiological metrics to infer pupil diameters")
+                df = infer_pupil_metrics(df, reference_data)
+                inferred_modalities.add('pupil')
+            
+            else:
+                logger.warning("Insufficient data to reliably infer pupil metrics")
+                # Set to population average as fallback
+                for metric in pupil_metrics:
+                    df[metric] = reference_data[metric].mean()
+        
+        elif len(pupil_metrics) == 1:  # One pupil metric is missing
+            # Mirror the available pupil metric
+            available_pupil = set(FEATURE_MODALITIES['pupil']) - set(pupil_metrics)
+            if available_pupil:
+                available_metric = list(available_pupil)[0]
+                missing_metric = pupil_metrics[0]
+                
+                logger.info(f"Using {available_metric} to infer {missing_metric}")
+                # Pupil diameters are typically similar between eyes
+                df[missing_metric] = df[available_metric] * (1 + np.random.normal(0, 0.05, len(df)))
+                inferred_modalities.add('pupil')
+    
+    # 3. Infer EEG metrics if missing
+    if 'eeg' in missing_features:
+        eeg_metrics = missing_features['eeg']
+        
+        if 'workload_intensity' in df.columns:
+            logger.info("Using workload intensity to infer EEG metrics")
             df = infer_eeg_metrics(df, reference_data)
+            inferred_modalities.add('eeg')
         
-        elif feature == "workload_intensity":
-            df = infer_workload_intensity(df, reference_data)
+        elif 'physiological' in available_features and len(available_features['physiological']) >= 2:
+            logger.info("Using physiological metrics to infer EEG metrics")
+            df = infer_eeg_metrics(df, reference_data)
+            inferred_modalities.add('eeg')
             
         else:
-            # Generic imputation for other features
-            df = impute_generic_feature(df, feature, reference_data)
+            logger.warning("Insufficient data to reliably infer EEG metrics")
+            # Set to population averages
+            for metric in eeg_metrics:
+                df[metric] = reference_data[metric].mean()
     
-    # Verify that all required features are now present
-    still_missing = [f for f in core_features if f not in df.columns]
-    if still_missing:
-        logger.warning(f"Some features could not be inferred: {still_missing}")
+    # 4. Infer gaze metrics if missing
+    if 'gaze' in missing_features:
+        gaze_metrics = missing_features['gaze']
+        
+        available_modality_count = sum(1 for modality in ['physiological', 'pupil', 'eeg'] 
+                                    if modality in available_features and available_features[modality])
+                                    
+        if available_modality_count >= 2:
+            logger.info("Inferring gaze metrics from other modalities")
+            
+            for metric in gaze_metrics:
+                # Get reference correlations
+                corr_with_reference = {}
+                for ref_col in df.columns:
+                    if ref_col in reference_data.columns and metric in reference_data.columns:
+                        corr = reference_data[[ref_col, metric]].corr().iloc[0, 1]
+                        if not np.isnan(corr):
+                            corr_with_reference[ref_col] = abs(corr)
+                
+                # Use top 3 correlated features for regression
+                if corr_with_reference:
+                    top_features = sorted(corr_with_reference.items(), key=lambda x: x[1], reverse=True)[:3]
+                    top_feature_names = [f[0] for f in top_features]
+                    
+                    # Create simple regression
+                    X_ref = reference_data[top_feature_names].values
+                    y_ref = reference_data[metric].values
+                    
+                    try:
+                        model = LinearRegression()
+                        model.fit(X_ref, y_ref)
+                        
+                        # Predict the missing values
+                        X_pred = df[top_feature_names].values
+                        df[metric] = model.predict(X_pred)
+                        
+                        logger.info(f"Inferred {metric} using regression from {top_feature_names}")
+                    except Exception as e:
+                        logger.error(f"Error inferring {metric}: {str(e)}")
+                        df[metric] = reference_data[metric].mean()
+                else:
+                    # Fallback to population average
+                    df[metric] = reference_data[metric].mean()
+            
+            inferred_modalities.add('gaze')
+        else:
+            logger.warning("Insufficient data to reliably infer gaze metrics")
+            # Set to population averages
+            for metric in gaze_metrics:
+                df[metric] = reference_data[metric].mean()
     
-    # Return in the same format as input
+    # 5. Infer physiological metrics if missing
+    if 'physiological' in missing_features:
+        physio_metrics = missing_features['physiological']
+        
+        available_modality_count = sum(1 for modality in ['gaze', 'pupil', 'eeg'] 
+                                  if modality in available_features and available_features[modality])
+                                  
+        if 'workload_intensity' in df.columns:
+            logger.info("Using workload intensity to infer physiological metrics")
+            
+            for metric in physio_metrics:
+                # Simple regression from workload intensity
+                if metric in reference_data.columns and 'workload_intensity' in reference_data.columns:
+                    # Get correlation
+                    corr = reference_data[[metric, 'workload_intensity']].corr().iloc[0, 1]
+                    
+                    if not np.isnan(corr) and abs(corr) > 0.3:
+                        # Create a simple linear regression
+                        X_ref = reference_data[['workload_intensity']].values
+                        y_ref = reference_data[metric].values
+                        
+                        try:
+                            model = LinearRegression()
+                            model.fit(X_ref, y_ref)
+                            
+                            # Predict the missing values
+                            X_pred = df[['workload_intensity']].values
+                            df[metric] = model.predict(X_pred)
+                            
+                            logger.info(f"Inferred {metric} from workload intensity (corr={corr:.2f})")
+                        except Exception as e:
+                            logger.error(f"Error inferring {metric}: {str(e)}")
+                            df[metric] = reference_data[metric].mean()
+                    else:
+                        # Low correlation, use population average with variation
+                        mean_val = reference_data[metric].mean()
+                        std_val = reference_data[metric].std() * 0.5  # Reduce variation
+                        df[metric] = np.random.normal(mean_val, std_val, len(df))
+                        logger.info(f"Inferred {metric} using population average (low correlation)")
+                else:
+                    # Metric not in reference data, use a reasonable default
+                    if metric == 'pulse_rate':
+                        df[metric] = np.random.normal(75, 5, len(df))
+                    elif metric == 'blood_pressure_sys':
+                        df[metric] = np.random.normal(120, 5, len(df))
+                    elif metric == 'resp_rate':
+                        df[metric] = np.random.normal(16, 2, len(df))
+                    else:
+                        df[metric] = 0
+            
+            inferred_modalities.add('physiological')
+        
+        elif available_modality_count >= 2:
+            logger.info("Inferring physiological metrics from other modalities")
+            
+            for metric in physio_metrics:
+                # Get reference correlations
+                corr_with_reference = {}
+                for ref_col in df.columns:
+                    if ref_col in reference_data.columns and metric in reference_data.columns:
+                        corr = reference_data[[ref_col, metric]].corr().iloc[0, 1]
+                        if not np.isnan(corr):
+                            corr_with_reference[ref_col] = abs(corr)
+                
+                # Use top 3 correlated features for regression
+                if corr_with_reference:
+                    top_features = sorted(corr_with_reference.items(), key=lambda x: x[1], reverse=True)[:3]
+                    top_feature_names = [f[0] for f in top_features]
+                    
+                    # Create simple regression
+                    X_ref = reference_data[top_feature_names].values
+                    y_ref = reference_data[metric].values
+                    
+                    try:
+                        model = LinearRegression()
+                        model.fit(X_ref, y_ref)
+                        
+                        # Predict the missing values
+                        X_pred = df[top_feature_names].values
+                        df[metric] = model.predict(X_pred)
+                        
+                        logger.info(f"Inferred {metric} using regression from {top_feature_names}")
+                    except Exception as e:
+                        logger.error(f"Error inferring {metric}: {str(e)}")
+                        df[metric] = reference_data[metric].mean()
+                else:
+                    # Fallback to population average
+                    df[metric] = reference_data[metric].mean()
+            
+            inferred_modalities.add('physiological')
+        else:
+            logger.warning("Insufficient data to reliably infer physiological metrics")
+            # Set to population averages
+            for metric in physio_metrics:
+                if metric == 'pulse_rate':
+                    df[metric] = np.random.normal(75, 5, len(df))
+                elif metric == 'blood_pressure_sys':
+                    df[metric] = np.random.normal(120, 5, len(df))
+                elif metric == 'resp_rate':
+                    df[metric] = np.random.normal(16, 2, len(df))
+                else:
+                    df[metric] = reference_data[metric].mean() if metric in reference_data.columns else 0
+    
+    # Log results
+    logger.info(f"Successfully inferred features for modalities: {inferred_modalities}")
+    
+    # If input was a dictionary, return a single row dict
     if is_dict_input:
         return df.iloc[0].to_dict()
     else:
@@ -3211,6 +3540,340 @@ def _train_model_wrapper(args):
     except Exception as e:
         logger.error(f"Error training {model_type} model in parallel process: {e}")
         return model_type, None, 0.0, 0.0
+
+def batch_predict(file_path, output_file=None, model_type=None, threshold=None, infer_missing=False):
+    """
+    Predict cognitive workload from a batch of samples in a CSV file.
+    
+    Args:
+        file_path (str): Path to input CSV file
+        output_file (str, optional): Path to output CSV file. If None, returns results without saving.
+        model_type (str, optional): Type of model to use. If None, uses best available model.
+        threshold (float, optional): Confidence threshold for prediction. If None, no threshold is applied.
+        infer_missing (bool, optional): Whether to infer missing features. Defaults to False.
+        
+    Returns:
+        list: List of prediction results
+    """
+    try:
+        df = pd.read_csv(file_path)
+        logger.info(f"Loaded {len(df)} records from {file_path}")
+    except Exception as e:
+        logger.error(f"Error loading file {file_path}: {str(e)}")
+        raise ValueError(f"Error loading file: {str(e)}")
+    
+    # Check missing features before inference
+    missing_modalities_count = {}
+    for modality, features in FEATURE_MODALITIES.items():
+        missing = [f for f in features if f not in df.columns]
+        if missing:
+            missing_modalities_count[modality] = len(missing)
+            logger.warning(f"Missing {len(missing)}/{len(features)} {modality} features")
+    
+    # Make predictions
+    if infer_missing:
+        logger.info("Inferring missing features")
+    
+    results = predict(df, model_type=model_type, threshold=threshold, infer_missing=infer_missing)
+    
+    # Extract quality metrics for summary
+    missing_modalities_list = set()
+    avg_confidence = 0.0
+    warning_counts = {}
+    
+    for result in results:
+        # Track quality metrics
+        missing_mods = result['data_quality']['missing_modalities']
+        for mod in missing_mods:
+            missing_modalities_list.add(mod)
+        
+        # Track confidence
+        avg_confidence += result['adjusted_confidence']
+        
+        # Track warnings
+        if 'quality_warning' in result:
+            warning = result['quality_warning']
+            warning_counts[warning] = warning_counts.get(warning, 0) + 1
+    
+    # Calculate average confidence
+    if results:
+        avg_confidence /= len(results)
+    
+    # Generate batch quality summary
+    quality_summary = {
+        'total_samples': len(results),
+        'average_confidence': avg_confidence,
+        'missing_modalities': list(missing_modalities_list),
+        'warning_counts': warning_counts
+    }
+    
+    logger.info(f"Batch prediction quality summary: {quality_summary}")
+    
+    # Save to file if specified
+    if output_file:
+        # Create a simpler format for CSV output
+        output_data = []
+        for i, result in enumerate(results):
+            row = {
+                'row_index': i,
+                'workload_class': result['workload_class'],
+                'workload_label': result['workload_label'],
+                'model_confidence': result['model_confidence'],
+                'adjusted_confidence': result['adjusted_confidence'],
+                'data_quality_score': result['data_quality']['final_confidence']
+            }
+            
+            # Add timestamp if present in original data
+            if 'timestamp' in df.columns:
+                row['timestamp'] = df.iloc[i]['timestamp']
+            
+            # Add quality warning if present
+            if 'quality_warning' in result:
+                row['quality_warning'] = result['quality_warning']
+            
+            # Add original features for reference
+            for feature in df.columns:
+                row[f'input_{feature}'] = df.iloc[i][feature]
+            
+            output_data.append(row)
+        
+        # Save as CSV
+        output_df = pd.DataFrame(output_data)
+        output_df.to_csv(output_file, index=False)
+        logger.info(f"Saved batch predictions to {output_file}")
+        
+        # Save quality summary
+        summary_file = os.path.splitext(output_file)[0] + "_quality_summary.json"
+        with open(summary_file, 'w') as f:
+            json.dump(quality_summary, f, indent=2)
+        logger.info(f"Saved batch quality summary to {summary_file}")
+    
+    return results
+
+def predict_time_series(file_path, output_file=None, window_size=10, step_size=5, 
+                       model_type=None, threshold=None, infer_missing=False, visualize=False):
+    """
+    Predict cognitive workload from time series data using a sliding window approach.
+    
+    Args:
+        file_path (str): Path to input CSV file with time series data
+        output_file (str, optional): Path to output CSV file. If None, returns results without saving.
+        window_size (int): Size of sliding window in samples. Default is 10.
+        step_size (int): Step size for sliding window. Default is 5.
+        model_type (str, optional): Type of model to use. If None, uses best available model.
+        threshold (float, optional): Confidence threshold for prediction. If None, no threshold is applied.
+        infer_missing (bool, optional): Whether to infer missing features. Defaults to False.
+        visualize (bool): Whether to generate visualization of the results. Default is False.
+        
+    Returns:
+        dict: Time series prediction results and quality metrics
+    """
+    try:
+        df = pd.read_csv(file_path)
+        logger.info(f"Loaded {len(df)} time points from {file_path}")
+    except Exception as e:
+        logger.error(f"Error loading file {file_path}: {str(e)}")
+        raise ValueError(f"Error loading file: {str(e)}")
+    
+    # Check for timestamp column
+    if 'timestamp' not in df.columns:
+        logger.warning("No timestamp column found in the data. Using row indices instead.")
+        df['timestamp'] = [f"t{i}" for i in range(len(df))]
+    
+    # Check for missing modalities
+    modality_availability = {}
+    for modality, features in FEATURE_MODALITIES.items():
+        available = [f for f in features if f in df.columns]
+        modality_availability[modality] = len(available) / len(features)
+        
+        if not available:
+            logger.warning(f"No features available for {modality} modality")
+        elif len(available) < len(features):
+            logger.warning(f"Partial features available for {modality} modality: {len(available)}/{len(features)}")
+    
+    # Infer missing features if requested
+    if infer_missing:
+        logger.info("Inferring missing features in time series data")
+        df = infer_missing_features(df)
+    
+    # Create sliding windows
+    windows = []
+    timestamps = []
+    for i in range(0, len(df) - window_size + 1, step_size):
+        window = df.iloc[i:i+window_size].copy()
+        windows.append(window)
+        timestamps.append(df.iloc[i]['timestamp'])
+    
+    logger.info(f"Created {len(windows)} windows from time series data")
+    
+    # Make predictions for each window
+    window_results = []
+    workload_classes = []
+    confidence_scores = []
+    quality_scores = []
+    
+    for window in windows:
+        # Predict for this window
+        results = predict(window, model_type=model_type, threshold=threshold, infer_missing=False)
+        
+        # For window results, take average of predictions
+        avg_class = None
+        avg_confidence = 0
+        avg_quality = 0
+        class_counts = {}
+        
+        for result in results:
+            # Count workload classes
+            if result['workload_class'] is not None:
+                class_counts[result['workload_class']] = class_counts.get(result['workload_class'], 0) + 1
+            
+            # Sum up confidences
+            avg_confidence += result['adjusted_confidence']
+            avg_quality += result['data_quality']['final_confidence']
+        
+        # Average the values
+        avg_confidence /= len(results)
+        avg_quality /= len(results)
+        
+        # Get most common class
+        if class_counts:
+            avg_class = max(class_counts.items(), key=lambda x: x[1])[0]
+        
+        # Store results
+        workload_classes.append(avg_class)
+        confidence_scores.append(avg_confidence)
+        quality_scores.append(avg_quality)
+        
+        # Create window result
+        window_result = {
+            'workload_class': avg_class,
+            'workload_label': WORKLOAD_CLASSES.get(avg_class, "Unknown"),
+            'confidence': avg_confidence,
+            'data_quality': avg_quality,
+            'detailed_results': results
+        }
+        window_results.append(window_result)
+    
+    # Generate overall quality metrics
+    avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0
+    avg_quality = sum(quality_scores) / len(quality_scores) if quality_scores else 0
+    
+    # Determine stability of predictions
+    stability = 0
+    if len(workload_classes) > 1:
+        changes = sum(1 for i in range(1, len(workload_classes)) 
+                    if workload_classes[i] != workload_classes[i-1])
+        stability = 1 - (changes / (len(workload_classes) - 1))
+    
+    # Generate time series quality summary
+    quality_summary = {
+        'total_windows': len(windows),
+        'window_size': window_size,
+        'step_size': step_size,
+        'average_confidence': avg_confidence,
+        'average_data_quality': avg_quality,
+        'prediction_stability': stability,
+        'modality_availability': modality_availability,
+        'inferred_features': infer_missing
+    }
+    
+    logger.info(f"Time series prediction quality summary: {quality_summary}")
+    
+    # Prepare results
+    ts_results = {
+        'timestamps': timestamps,
+        'workload_classes': workload_classes,
+        'confidence_scores': confidence_scores,
+        'quality_scores': quality_scores,
+        'window_results': window_results,
+        'quality_summary': quality_summary
+    }
+    
+    # Save to file if specified
+    if output_file:
+        # Create DataFrame for output
+        output_df = pd.DataFrame({
+            'timestamp': timestamps,
+            'workload_class': workload_classes,
+            'workload_label': [WORKLOAD_CLASSES.get(c, "Unknown") for c in workload_classes],
+            'confidence': confidence_scores,
+            'data_quality': quality_scores
+        })
+        
+        # Save CSV
+        output_df.to_csv(output_file, index=False)
+        logger.info(f"Saved time series predictions to {output_file}")
+        
+        # Save quality summary
+        summary_file = os.path.splitext(output_file)[0] + "_quality_summary.json"
+        with open(summary_file, 'w') as f:
+            json.dump(quality_summary, f, indent=2)
+        logger.info(f"Saved time series quality summary to {summary_file}")
+        
+        # Generate visualization if requested
+        if visualize:
+            try:
+                # Create the visualization
+                plt.figure(figsize=(12, 8))
+                
+                # Plot workload classes
+                ax1 = plt.subplot(3, 1, 1)
+                ax1.plot(range(len(timestamps)), workload_classes, 'b-', marker='o')
+                ax1.set_ylabel('Workload Class')
+                ax1.set_title('Time Series Workload Prediction')
+                ax1.set_ylim(-0.5, 3.5)  # Assuming 0=Low, 1=Medium, 2=High, 3=Very High
+                ax1.set_yticks([0, 1, 2, 3])
+                ax1.set_yticklabels(['Low', 'Medium', 'High', 'Very High'])
+                ax1.grid(True)
+                
+                # Plot confidence scores
+                ax2 = plt.subplot(3, 1, 2, sharex=ax1)
+                ax2.plot(range(len(timestamps)), confidence_scores, 'g-', marker='s')
+                ax2.set_ylabel('Confidence')
+                ax2.set_ylim(0, 1.05)
+                ax2.grid(True)
+                
+                # Plot data quality
+                ax3 = plt.subplot(3, 1, 3, sharex=ax1)
+                ax3.plot(range(len(timestamps)), quality_scores, 'r-', marker='^')
+                ax3.set_ylabel('Data Quality')
+                ax3.set_xlabel('Time Window')
+                ax3.set_ylim(0, 1.05)
+                ax3.grid(True)
+                
+                # Set x-ticks to show some of the timestamps
+                if len(timestamps) > 20:
+                    tick_indices = list(range(0, len(timestamps), len(timestamps) // 10))
+                    if tick_indices[-1] != len(timestamps) - 1:
+                        tick_indices.append(len(timestamps) - 1)
+                else:
+                    tick_indices = range(len(timestamps))
+                
+                plt.xticks(tick_indices, [timestamps[i] for i in tick_indices], rotation=45)
+                
+                # Add annotations for missing modalities
+                missing_mods_text = "Missing Modalities: "
+                missing_mods = [mod for mod, avail in modality_availability.items() if avail < 1.0]
+                if missing_mods:
+                    missing_mods_text += ", ".join(missing_mods)
+                else:
+                    missing_mods_text += "None"
+                
+                plt.figtext(0.5, 0.01, missing_mods_text, ha='center', fontsize=10, 
+                           bbox={"facecolor":"orange", "alpha":0.2, "pad":5})
+                
+                plt.tight_layout()
+                
+                # Save the figure
+                visualization_file = os.path.splitext(output_file)[0] + ".png"
+                plt.savefig(visualization_file)
+                logger.info(f"Saved visualization to {visualization_file}")
+                plt.close()
+                
+            except Exception as e:
+                logger.error(f"Error generating visualization: {str(e)}")
+    
+    return ts_results
 
 if __name__ == "__main__":
     # Special case for !help command
