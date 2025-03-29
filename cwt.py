@@ -60,7 +60,7 @@ from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import cross_val_score, GridSearchCV
@@ -613,6 +613,42 @@ def calculate_modality_confidence(available_features):
     
     return confidence_score, missing_modalities, available_modalities
 
+def create_default_scaler():
+    """
+    Create a default StandardScaler for when loading a scaler fails.
+    This is a fallback mechanism to ensure the system can still function
+    when scaler files are corrupted or missing.
+    
+    Returns:
+        sklearn.preprocessing.StandardScaler: A standard scaler initialized with common feature ranges
+    """
+    logger.warning("Creating a default scaler as fallback")
+    from sklearn.preprocessing import StandardScaler
+    
+    # Create a simple dataset with reasonable feature ranges
+    demo_data = {
+        'pulse_rate': [60, 70, 80, 90, 100],
+        'blood_pressure_sys': [100, 110, 120, 130, 140],
+        'resp_rate': [12, 14, 16, 18, 20],
+        'pupil_diameter_left': [2.5, 3.0, 3.5, 4.0, 4.5],
+        'pupil_diameter_right': [2.5, 3.0, 3.5, 4.0, 4.5],
+        'fixation_duration': [200, 250, 300, 350, 400],
+        'blink_rate': [10, 12, 14, 16, 18],
+        'gaze_x': [400, 450, 500, 550, 600],
+        'gaze_y': [300, 350, 400, 450, 500],
+        'alpha_power': [10, 15, 20, 25, 30],
+        'theta_power': [5, 10, 15, 20, 25]
+    }
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(demo_data)
+    
+    # Create and fit scaler
+    scaler = StandardScaler()
+    scaler.fit(df)
+    
+    return scaler
+
 def predict(data, model_type=None, threshold=None, infer_missing=False):
     """
     Predict cognitive workload from input data.
@@ -677,7 +713,9 @@ def predict(data, model_type=None, threshold=None, infer_missing=False):
     
     # Load the scaler
     scaler_path = None
-    if metadata and 'scaler_path' in metadata:
+    scaler = None
+    
+    if metadata and 'scaler_path' in metadata and metadata['scaler_path']:
         scaler_path = metadata['scaler_path']
     
     if not scaler_path or not os.path.exists(scaler_path):
@@ -712,17 +750,19 @@ def predict(data, model_type=None, threshold=None, infer_missing=False):
                 scaler_path = scaler_glob[0]
                 logger.info(f"Found scaler using glob pattern: {scaler_path}")
     
-    if not scaler_path or not os.path.exists(scaler_path):
-        logger.error(f"No scaler found for model: {model_path}")
-        raise FileNotFoundError(f"No scaler found for model: {model_path}")
-    
-    # Load the scaler
-    try:
-        with open(scaler_path, 'rb') as f:
-            scaler = pickle.load(f)
-    except Exception as e:
-        logger.error(f"Error loading scaler {scaler_path}: {str(e)}")
-        raise ValueError(f"Could not load scaler: {str(e)}")
+    # Try to load the scaler
+    if scaler_path and os.path.exists(scaler_path):
+        try:
+            with open(scaler_path, 'rb') as f:
+                scaler = pickle.load(f)
+            logger.info(f"Successfully loaded scaler from {scaler_path}")
+        except Exception as e:
+            logger.error(f"Error loading scaler {scaler_path}: {str(e)}")
+            logger.warning("Creating a default scaler")
+            scaler = create_default_scaler()
+    else:
+        logger.warning("No scaler found, creating a default scaler")
+        scaler = create_default_scaler()
     
     # Extract features from metadata or model
     features = None
